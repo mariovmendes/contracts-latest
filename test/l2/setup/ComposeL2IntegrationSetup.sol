@@ -121,7 +121,7 @@ contract ComposeL2IntegrationSetup is Test {
         mailbox = new UniversalBridgeMailbox(coordinator, owner);
         ethLiquidity = new ComposeETHLiquidity(owner);
 
-        l2l2Bridge = new ComposeL2ToL2Bridge(address(mailbox), address(cetFactory), address(ethLiquidity));
+        l2l2Bridge = new ComposeL2ToL2Bridge(address(mailbox), address(cetFactory), address(ethLiquidity), coordinator);
 
         l2Bridge = new L2ComposeBridge(address(messenger), address(cetFactory), L1_CHAIN_ID);
 
@@ -164,6 +164,48 @@ contract ComposeL2IntegrationSetup is Test {
         mailbox.putInbox(chainSrc, sender, receiver, sessionId, label, data);
     }
 
+    /// @dev Relays the ACK an l2l2Bridge just wrote to its own outbox (bridge-to-bridge, since the
+    ///      bridge is deployed at the same address on every chain) into the local inbox, so the
+    ///      remote-chain bridge can later call `sendConfirm`.
+    function _coordinatorRelayAck(uint256 ackChainSrc, uint256 sessionId, bytes memory ackPayload) internal {
+        _coordinatorPutInbox(ackChainSrc, address(l2l2Bridge), address(l2l2Bridge), sessionId, "ACK", ackPayload);
+    }
+
+    function _coordinatorSendConfirm(IUniversalBridgeMailbox.MessageHeader memory sendHeader) internal {
+        vm.prank(coordinator);
+        l2l2Bridge.sendConfirm(sendHeader);
+    }
+
+    function _coordinatorSendAbortToken(uint256 chainDest, address token, address sender, address receiver, uint256 amount, uint256 sessionId) internal {
+        vm.prank(coordinator);
+        l2l2Bridge.sendAbortToken(chainDest, token, sender, receiver, amount, sessionId);
+    }
+
+    function _coordinatorSendAbortETH(uint256 chainDest, address sender, address receiver, uint256 amount, uint256 sessionId) internal {
+        vm.prank(coordinator);
+        l2l2Bridge.sendAbortETH(chainDest, sender, receiver, amount, sessionId);
+    }
+
+    function _coordinatorRecvConfirmToken(IUniversalBridgeMailbox.MessageHeader memory msgHeader) internal returns (address token, uint256 amount) {
+        vm.prank(coordinator);
+        (token, amount) = l2l2Bridge.recvConfirmToken(msgHeader);
+    }
+
+    function _coordinatorRecvAbortToken(IUniversalBridgeMailbox.MessageHeader memory msgHeader) internal {
+        vm.prank(coordinator);
+        l2l2Bridge.recvAbortToken(msgHeader);
+    }
+
+    function _coordinatorRecvConfirmETH(IUniversalBridgeMailbox.MessageHeader memory msgHeader) internal returns (uint256 amount) {
+        vm.prank(coordinator);
+        amount = l2l2Bridge.recvConfirmETH(msgHeader);
+    }
+
+    function _coordinatorRecvAbortETH(IUniversalBridgeMailbox.MessageHeader memory msgHeader) internal {
+        vm.prank(coordinator);
+        l2l2Bridge.recvAbortETH(msgHeader);
+    }
+
     function _predictCET(address remoteAsset, uint256 remoteChainId) internal view returns (address) {
         return cetFactory.predictAddress(remoteAsset, remoteChainId);
     }
@@ -179,6 +221,7 @@ contract ComposeL2IntegrationSetup is Test {
         assertTrue(cetFactory.authorizedBridges(address(l2Bridge)));
         assertTrue(ethLiquidity.authorizedBridges(address(l2l2Bridge)));
         assertTrue(mailbox.authorizedBridges(address(l2l2Bridge)));
+        assertEq(l2l2Bridge.COORDINATOR(), coordinator);
 
         assertEq(address(l2l2Bridge.mailbox()), address(mailbox));
         assertEq(address(l2l2Bridge.cetFactory()), address(cetFactory));
@@ -387,9 +430,6 @@ contract ComposeL2IntegrationSetup is Test {
         vm.prank(alice);
         nativeToken.approve(address(l2l2Bridge), amount);
 
-        bytes memory ackPayload = abi.encode(address(nativeToken), amount);
-        _coordinatorPutInbox(REMOTE_L2_CHAIN_ID, bob, address(l2l2Bridge), sessionId, "ACK", ackPayload);
-
         uint256 aliceBefore = nativeToken.balanceOf(alice);
         uint256 bridgeBefore = nativeToken.balanceOf(address(l2l2Bridge));
 
@@ -425,12 +465,17 @@ contract ComposeL2IntegrationSetup is Test {
 
         assertEq(outToken, address(nativeToken));
         assertEq(outAmount, amount);
-        assertEq(nativeToken.balanceOf(bob), bobBefore + amount);
-        assertEq(nativeToken.balanceOf(address(l2l2Bridge)), bridgeBefore - amount);
+        // Pending: recv() doesn't deliver yet, only recvConfirmToken does.
+        assertEq(nativeToken.balanceOf(bob), bobBefore);
+        assertEq(nativeToken.balanceOf(address(l2l2Bridge)), bridgeBefore);
 
         bytes32 ackKey = mailbox.getKey(block.chainid, REMOTE_L2_CHAIN_ID, address(l2l2Bridge), address(l2l2Bridge), sessionId, "ACK");
         bytes memory expectedAck = abi.encode(address(nativeToken), amount);
         assertEq(keccak256(mailbox.outbox(ackKey)), keccak256(expectedAck));
+
+        _coordinatorRecvConfirmToken(hdr);
+        assertEq(nativeToken.balanceOf(bob), bobBefore + amount);
+        assertEq(nativeToken.balanceOf(address(l2l2Bridge)), bridgeBefore - amount);
     }
 
     function test_l2l2_receiveTokens_remoteChain_deploysCetAndMints() public {
@@ -454,7 +499,9 @@ contract ComposeL2IntegrationSetup is Test {
         assertGt(predictedCet.code.length, 0);
 
         ComposableERC20 cet = ComposableERC20(predictedCet);
-        assertEq(cet.balanceOf(bob), amount);
+        // Pending: minted to the bridge itself until recvConfirmToken delivers it.
+        assertEq(cet.balanceOf(address(l2l2Bridge)), amount);
+        assertEq(cet.balanceOf(bob), 0);
         assertEq(cet.totalSupply(), amount);
         assertEq(cet.name(), "Remote");
         assertEq(cet.symbol(), "RMT");
@@ -463,6 +510,10 @@ contract ComposeL2IntegrationSetup is Test {
         assertEq(cet.remoteChainID(), REMOTE_L2_CHAIN_ID);
 
         _assertAckOutbox(sessionId, remoteAsset, amount);
+
+        _coordinatorRecvConfirmToken(hdr);
+        assertEq(cet.balanceOf(bob), amount);
+        assertEq(cet.balanceOf(address(l2l2Bridge)), 0);
     }
 
     function _pushSendTokensToInbox(address remoteAsset, uint256 amount, uint256 sessionId, address receiver) internal {
@@ -491,9 +542,6 @@ contract ComposeL2IntegrationSetup is Test {
         assertEq(cet.balanceOf(alice), amount);
         assertEq(cet.totalSupply(), amount);
 
-        bytes memory ackPayload = abi.encode(l1Token, amount);
-        _coordinatorPutInbox(REMOTE_L2_CHAIN_ID, bob, address(l2l2Bridge), sessionId, "ACK", ackPayload);
-
         vm.prank(alice);
         l2l2Bridge.bridgeCETTo(REMOTE_L2_CHAIN_ID, predictedCet, amount, bob, sessionId);
 
@@ -511,9 +559,6 @@ contract ComposeL2IntegrationSetup is Test {
         bytes memory depositMsg = abi.encodeWithSelector(l2Bridge.finalizeBridgeERC20.selector, predictedCet, l1Token, alice, alice, amount, packed);
         (bool okDep,) = _relayFromL1Bridge(address(l2Bridge), 0, depositMsg);
         assertTrue(okDep);
-
-        bytes memory ackPayload = abi.encode(l1Token, amount);
-        _coordinatorPutInbox(REMOTE_L2_CHAIN_ID, bob, address(l2l2Bridge), sessionId, "ACK", ackPayload);
 
         vm.prank(alice);
         l2l2Bridge.bridgeCETTo(REMOTE_L2_CHAIN_ID, predictedCet, amount, bob, sessionId);
@@ -549,9 +594,6 @@ contract ComposeL2IntegrationSetup is Test {
         uint256 amount = 1 ether;
         uint256 sessionId = 0x6666;
 
-        bytes memory ackPayload = abi.encode(address(0), amount);
-        _coordinatorPutInbox(REMOTE_L2_CHAIN_ID, bob, address(l2l2Bridge), sessionId, "ACK", ackPayload);
-
         uint256 aliceBefore = alice.balance;
         uint256 lqBefore = address(ethLiquidity).balance;
         uint256 bridgeBefore = address(l2l2Bridge).balance;
@@ -567,9 +609,6 @@ contract ComposeL2IntegrationSetup is Test {
     function test_l2l2_bridgeEthTo_writesSendEth() public {
         uint256 amount = 1 ether;
         uint256 sessionId = 0x7777;
-
-        bytes memory ackPayload = abi.encode(address(0), amount);
-        _coordinatorPutInbox(REMOTE_L2_CHAIN_ID, bob, address(l2l2Bridge), sessionId, "ACK", ackPayload);
 
         vm.prank(alice);
         l2l2Bridge.bridgeEthTo{value: amount}(sessionId, REMOTE_L2_CHAIN_ID, bob);
@@ -598,6 +637,12 @@ contract ComposeL2IntegrationSetup is Test {
         uint256 outAmount = l2l2Bridge.receiveETH(hdr);
 
         assertEq(outAmount, amount);
+        // Pending: recv() mints into this contract's own balance; recvConfirmETH forwards it.
+        assertEq(bob.balance, bobBefore);
+        assertEq(address(ethLiquidity).balance, lqBefore - amount);
+        assertEq(address(l2l2Bridge).balance, bridgeBefore + amount);
+
+        _coordinatorRecvConfirmETH(hdr);
         assertEq(bob.balance, bobBefore + amount);
         assertEq(address(ethLiquidity).balance, lqBefore - amount);
         assertEq(address(l2l2Bridge).balance, bridgeBefore);
@@ -713,9 +758,6 @@ contract ComposeL2IntegrationSetup is Test {
         vm.prank(alice);
         nativeToken.approve(address(l2l2Bridge), amount);
 
-        bytes memory ackPayload = abi.encode(address(nativeToken), amount);
-        _coordinatorPutInbox(chainB, bob, address(l2l2Bridge), sessionId, "ACK", ackPayload);
-
         vm.prank(alice);
         l2l2Bridge.bridgeERC20To(chainB, address(nativeToken), amount, bob, sessionId);
 
@@ -737,13 +779,13 @@ contract ComposeL2IntegrationSetup is Test {
         (address outToken, uint256 outAmount) = l2l2Bridge.receiveTokens(hdr);
         assertEq(outToken, predictedCet);
         assertEq(outAmount, amount);
+        assertEq(ComposableERC20(predictedCet).balanceOf(bob), 0);
+
+        _coordinatorRecvConfirmToken(hdr);
         assertEq(ComposableERC20(predictedCet).balanceOf(bob), amount);
     }
 
     function _roundTrip_stepBack(uint256 chainA, uint256 chainB, uint256 amount, uint256 sessionId, address cet) internal {
-        bytes memory ackPayload = abi.encode(address(nativeToken), amount);
-        _coordinatorPutInbox(chainA, alice, address(l2l2Bridge), sessionId, "ACK", ackPayload);
-
         vm.prank(bob);
         l2l2Bridge.bridgeCETTo(chainA, cet, amount, alice, sessionId);
 
@@ -768,6 +810,8 @@ contract ComposeL2IntegrationSetup is Test {
 
         vm.prank(alice);
         l2l2Bridge.receiveTokens(hdr);
+
+        _coordinatorRecvConfirmToken(hdr);
     }
 
     function test_flow_cetDepositedFromL1_canBeBridgedL2L2() public {
@@ -797,9 +841,6 @@ contract ComposeL2IntegrationSetup is Test {
     }
 
     function _l2l2_bridgeCET_to_B(uint256 chainA, uint256 chainB, uint256 amount, uint256 sessionId, address cet, address l1Token) internal {
-        bytes memory ackPayload = abi.encode(l1Token, amount);
-        _coordinatorPutInbox(chainB, bob, address(l2l2Bridge), sessionId, "ACK", ackPayload);
-
         vm.prank(alice);
         l2l2Bridge.bridgeCETTo(chainB, cet, amount, bob, sessionId);
 
@@ -823,6 +864,10 @@ contract ComposeL2IntegrationSetup is Test {
 
         assertEq(outToken, predictedCet);
         assertEq(outAmount, amount);
+        assertEq(ComposableERC20(predictedCet).balanceOf(bob), 0);
+        assertEq(ComposableERC20(predictedCet).totalSupply(), amount);
+
+        _coordinatorRecvConfirmToken(hdr);
         assertEq(ComposableERC20(predictedCet).balanceOf(bob), amount);
         assertEq(ComposableERC20(predictedCet).totalSupply(), amount);
     }

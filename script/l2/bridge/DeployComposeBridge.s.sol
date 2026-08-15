@@ -76,7 +76,10 @@ contract DeployComposeBridge is Script {
 
         l2l2Bridge = ComposeL2ToL2Bridge(
             payable(_deploy(
-                    salt, abi.encodePacked(type(ComposeL2ToL2Bridge).creationCode, abi.encode(address(mailbox), address(cetFactory), address(ethLiquidity)))
+                    salt,
+                    abi.encodePacked(
+                        type(ComposeL2ToL2Bridge).creationCode, abi.encode(address(mailbox), address(cetFactory), address(ethLiquidity), coordinator)
+                    )
                 ))
         );
         console.log("[1d] ComposeL2ToL2Bridge      :", address(l2l2Bridge));

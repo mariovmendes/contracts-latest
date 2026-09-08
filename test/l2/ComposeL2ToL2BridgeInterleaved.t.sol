@@ -50,7 +50,7 @@ contract ComposeL2ToL2BridgeInterleaved is ComposeL2IntegrationSetup {
 
         uint256 bridgeBalanceAfterSend = nativeToken.balanceOf(address(l2l2Bridge));
 
-        _coordinatorRelayAck(REMOTE_L2_CHAIN_ID, sessionId, abi.encode(address(nativeToken), amount));
+        _coordinatorRelayAck(REMOTE_L2_CHAIN_ID, bob, sessionId, abi.encode(address(nativeToken), amount));
 
         vm.expectEmit(true, true, true, true, address(l2l2Bridge));
         emit IComposeL2ToL2Bridge.SendConfirmed(REMOTE_L2_CHAIN_ID, bob, sessionId, "SEND_TOKENS");
@@ -86,7 +86,7 @@ contract ComposeL2ToL2BridgeInterleaved is ComposeL2IntegrationSetup {
         vm.prank(alice);
         l2l2Bridge.bridgeERC20To(REMOTE_L2_CHAIN_ID, address(nativeToken), amount, bob, sessionId);
 
-        _coordinatorRelayAck(REMOTE_L2_CHAIN_ID, sessionId, abi.encode(address(nativeToken), amount));
+        _coordinatorRelayAck(REMOTE_L2_CHAIN_ID, bob, sessionId, abi.encode(address(nativeToken), amount));
 
         IUniversalBridgeMailbox.MessageHeader memory sendHeader = _sendTokensHeader(REMOTE_L2_CHAIN_ID, bob, sessionId);
         _coordinatorSendConfirm(sendHeader);
@@ -213,7 +213,8 @@ contract ComposeL2ToL2BridgeInterleaved is ComposeL2IntegrationSetup {
         ComposableERC20 cet = ComposableERC20(predictedCet);
         assertEq(cet.balanceOf(address(l2l2Bridge)), amount);
 
-        bytes32 ackKey = mailbox.getKey(block.chainid, REMOTE_L2_CHAIN_ID, address(l2l2Bridge), address(l2l2Bridge), sessionId, "ACK");
+        // ACK is keyed sender = the original SEND's receiver (the end user), receiver = the bridge.
+        bytes32 ackKey = mailbox.getKey(block.chainid, REMOTE_L2_CHAIN_ID, bob, address(l2l2Bridge), sessionId, "ACK");
         assertTrue(mailbox.createdKeys(ackKey));
 
         vm.expectEmit(true, true, true, true, address(l2l2Bridge));
@@ -323,14 +324,14 @@ contract ComposeL2ToL2BridgeInterleaved is ComposeL2IntegrationSetup {
         l2l2Bridge.bridgeEthTo{value: ethAmount}(ethSession, REMOTE_L2_CHAIN_ID, bob);
 
         // Confirm the *second* session (ETH) before the first (ERC20) — out of initiation order.
-        _coordinatorRelayAck(REMOTE_L2_CHAIN_ID, ethSession, abi.encode(address(0), ethAmount));
+        _coordinatorRelayAck(REMOTE_L2_CHAIN_ID, bob, ethSession, abi.encode(address(0), ethAmount));
         _coordinatorSendConfirm(_sendEthHeader(REMOTE_L2_CHAIN_ID, bob, ethSession));
 
         // The ERC20 session is untouched by the ETH session's confirm.
         bytes32 erc20OutKey = mailbox.getKey(block.chainid, REMOTE_L2_CHAIN_ID, address(l2l2Bridge), bob, erc20Session, "SEND_TOKENS");
         assertTrue(mailbox.createdKeys(erc20OutKey));
 
-        _coordinatorRelayAck(REMOTE_L2_CHAIN_ID, erc20Session, abi.encode(address(nativeToken), erc20Amount));
+        _coordinatorRelayAck(REMOTE_L2_CHAIN_ID, bob, erc20Session, abi.encode(address(nativeToken), erc20Amount));
         _coordinatorSendConfirm(_sendTokensHeader(REMOTE_L2_CHAIN_ID, bob, erc20Session));
 
         // Both sessions' outbox roots ended up finalized independently of execution order.
@@ -373,5 +374,136 @@ contract ComposeL2ToL2BridgeInterleaved is ComposeL2IntegrationSetup {
         assertEq(token, cetConfirmed);
         assertEq(delivered, amount);
         assertEq(ComposableERC20(cetConfirmed).balanceOf(bob), amount);
+    }
+
+    // ============================================================
+    // compensation cost must not scale with outbox size
+    // ============================================================
+
+    /// Regression: `unwrite`'s header removal used to linearly scan
+    /// `messageHeaderListOutbox`, which only ever grows (confirms never prune
+    /// it). On a busy chain the scan exceeded the gas forwarded to the call, so
+    /// every `sendAbortToken` reverted out-of-gas and the escrowed tokens were
+    /// stranded forever. The scan walks from index 0, so the worst case is a
+    /// session near the END of the list — which is exactly the real pattern,
+    /// since an XT is aborted shortly after its send is written. This builds a
+    /// backlog first, then aborts the newest session.
+    function test_sendAbortToken_costDoesNotScaleWithOutboxBacklog() public {
+        uint256 amount = 1e18;
+        uint256 abortedSession = 0x7001;
+        uint256 aliceBefore = nativeToken.balanceOf(alice);
+
+        vm.prank(alice);
+        nativeToken.approve(address(l2l2Bridge), type(uint256).max);
+
+        uint256 backlog = 400;
+        for (uint256 i = 0; i < backlog; i++) {
+            vm.prank(alice);
+            l2l2Bridge.bridgeERC20To(REMOTE_L2_CHAIN_ID, address(nativeToken), amount, bob, 0x8000 + i);
+        }
+
+        // Written last => sits at the end of the header list => the linear scan
+        // has to walk the whole backlog to reach it.
+        vm.prank(alice);
+        l2l2Bridge.bridgeERC20To(REMOTE_L2_CHAIN_ID, address(nativeToken), amount, bob, abortedSession);
+
+        bytes32 outKey = mailbox.getKey(block.chainid, REMOTE_L2_CHAIN_ID, address(l2l2Bridge), bob, abortedSession, "SEND_TOKENS");
+        assertTrue(mailbox.createdKeys(outKey), "target message should exist before abort");
+
+        uint256 gasBefore = gasleft();
+        _coordinatorSendAbortToken(REMOTE_L2_CHAIN_ID, address(nativeToken), alice, bob, amount, abortedSession);
+        uint256 gasUsed = gasBefore - gasleft();
+
+        // Escrow returned and the message is gone: compensation actually ran.
+        assertEq(nativeToken.balanceOf(alice), aliceBefore - (amount * backlog), "escrow for the aborted session must be refunded");
+        assertFalse(mailbox.createdKeys(outKey), "aborted message must be removed");
+
+        // With the old O(n) scan this cost grew without bound and blew the gas
+        // limit; O(1) removal keeps it flat regardless of backlog depth.
+        assertLt(gasUsed, 250_000, "compensation gas must not scale with outbox backlog");
+    }
+
+    /// Same guarantee for the receiver-side compensation, whose `removeInbox`
+    /// shared the identical linear-scan defect.
+    function test_removeInbox_costDoesNotScaleWithInboxBacklog() public {
+        uint256 targetSession = 0x9001;
+        bytes memory payload = abi.encode(uint256(1), address(nativeToken), uint256(1e18), "Native", "NAT", uint8(18));
+
+        for (uint256 i = 0; i < 400; i++) {
+            _coordinatorPutInbox(REMOTE_L2_CHAIN_ID, address(l2l2Bridge), bob, 0xA000 + i, "SEND_TOKENS", payload);
+        }
+
+        // Added last => worst case for the old linear scan.
+        _coordinatorPutInbox(REMOTE_L2_CHAIN_ID, address(l2l2Bridge), bob, targetSession, "SEND_TOKENS", payload);
+
+        bytes32 inKey = mailbox.getKey(REMOTE_L2_CHAIN_ID, block.chainid, address(l2l2Bridge), bob, targetSession, "SEND_TOKENS");
+        assertTrue(mailbox.createdKeys(inKey), "target inbox message should exist");
+
+        uint256 gasBefore = gasleft();
+        vm.prank(coordinator);
+        mailbox.removeInbox(REMOTE_L2_CHAIN_ID, address(l2l2Bridge), bob, targetSession, "SEND_TOKENS", payload);
+        uint256 gasUsed = gasBefore - gasleft();
+
+        assertFalse(mailbox.createdKeys(inKey), "inbox message must be removed");
+        assertLt(gasUsed, 250_000, "removeInbox gas must not scale with inbox backlog");
+    }
+
+    /// The swap-and-pop must re-index the element moved into the vacated slot,
+    /// otherwise a later removal of THAT message would corrupt the list or
+    /// silently no-op.
+    function test_headerRemoval_reindexesSwappedElement() public {
+        bytes memory payload = abi.encode(uint256(1), address(nativeToken), uint256(1e18), "Native", "NAT", uint8(18));
+
+        _coordinatorPutInbox(REMOTE_L2_CHAIN_ID, address(l2l2Bridge), bob, 0xB001, "SEND_TOKENS", payload);
+        _coordinatorPutInbox(REMOTE_L2_CHAIN_ID, address(l2l2Bridge), bob, 0xB002, "SEND_TOKENS", payload);
+        _coordinatorPutInbox(REMOTE_L2_CHAIN_ID, address(l2l2Bridge), bob, 0xB003, "SEND_TOKENS", payload);
+
+        // Removing the first entry swaps the LAST one (0xB003) into slot 0.
+        vm.prank(coordinator);
+        mailbox.removeInbox(REMOTE_L2_CHAIN_ID, address(l2l2Bridge), bob, 0xB001, "SEND_TOKENS", payload);
+
+        // The swapped element must still be removable by its own key.
+        vm.prank(coordinator);
+        mailbox.removeInbox(REMOTE_L2_CHAIN_ID, address(l2l2Bridge), bob, 0xB003, "SEND_TOKENS", payload);
+
+        bytes32 movedKey = mailbox.getKey(REMOTE_L2_CHAIN_ID, block.chainid, address(l2l2Bridge), bob, 0xB003, "SEND_TOKENS");
+        assertFalse(mailbox.createdKeys(movedKey), "swapped-then-removed message must be gone");
+
+        // The untouched middle entry survives and is still the only one left.
+        (,,,, uint256 remainingSession,) = mailbox.messageHeaderListInbox(0);
+        assertEq(remainingSession, 0xB002, "surviving header should be the untouched session");
+    }
+
+    // ============================================================
+    // ACK keying must agree across the two chains
+    // ============================================================
+
+    /// Regression: `writeMessage` keyed the outbox on `msg.sender` (the bridge), silently
+    /// discarding the `sender` that `receiveTokens` set on the ACK header (the original SEND's
+    /// receiver, i.e. the end user). The destination chain therefore stored the ACK under a
+    /// different key than the one the coordinator relays to the source chain via `putInbox` and
+    /// that `sendConfirm` reads back — so the two chains' ACK roots could never reconcile, even
+    /// though the SEND roots did. Nothing reverted, because each chain was internally consistent:
+    /// only a cross-chain comparison of the two keys exposes it.
+    function test_receiveTokens_ackKeyMatchesWhatSourceChainRelays() public {
+        address remoteAsset = makeAddr("remoteAssetAckKey");
+        uint256 amount = 25e18;
+        uint256 sessionId = 0xC001;
+
+        bytes memory payload = abi.encode(REMOTE_L2_CHAIN_ID, remoteAsset, amount, "Remote", "RMT", uint8(18));
+        _coordinatorPutInbox(REMOTE_L2_CHAIN_ID, address(l2l2Bridge), bob, sessionId, "SEND_TOKENS", payload);
+
+        IUniversalBridgeMailbox.MessageHeader memory hdr = _recvHeader(REMOTE_L2_CHAIN_ID, bob, sessionId, "SEND_TOKENS");
+        vm.prank(bob);
+        l2l2Bridge.receiveTokens(hdr);
+
+        // Exactly the key the source chain relays via `putInbox` and `sendConfirm` looks up.
+        bytes32 relayedAckKey = mailbox.getKey(block.chainid, REMOTE_L2_CHAIN_ID, bob, address(l2l2Bridge), sessionId, "ACK");
+        assertTrue(mailbox.createdKeys(relayedAckKey), "ACK must be keyed on the original SEND's receiver");
+        assertEq(keccak256(mailbox.outbox(relayedAckKey)), keccak256(abi.encode(remoteAsset, amount)), "ACK payload must sit under the relayed key");
+
+        // The pre-fix bridge-to-bridge key must not exist, or the roots diverge again.
+        bytes32 bridgeKeyedAck = mailbox.getKey(block.chainid, REMOTE_L2_CHAIN_ID, address(l2l2Bridge), address(l2l2Bridge), sessionId, "ACK");
+        assertFalse(mailbox.createdKeys(bridgeKeyedAck), "ACK must not be re-keyed to the bridge");
     }
 }

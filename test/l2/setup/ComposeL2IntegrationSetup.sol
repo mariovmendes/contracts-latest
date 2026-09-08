@@ -164,11 +164,12 @@ contract ComposeL2IntegrationSetup is Test {
         mailbox.putInbox(chainSrc, sender, receiver, sessionId, label, data);
     }
 
-    /// @dev Relays the ACK an l2l2Bridge just wrote to its own outbox (bridge-to-bridge, since the
-    ///      bridge is deployed at the same address on every chain) into the local inbox, so the
-    ///      remote-chain bridge can later call `sendConfirm`.
-    function _coordinatorRelayAck(uint256 ackChainSrc, uint256 sessionId, bytes memory ackPayload) internal {
-        _coordinatorPutInbox(ackChainSrc, address(l2l2Bridge), address(l2l2Bridge), sessionId, "ACK", ackPayload);
+    /// @dev Relays the ACK an l2l2Bridge just wrote to its own outbox into the local inbox, so the
+    ///      remote-chain bridge can later call `sendConfirm`. Keyed the same way receiveTokens/
+    ///      receiveETH actually wrote it: sender = the original SEND's receiver (the end user),
+    ///      receiver = the bridge contract (same address on every chain, CREATE2).
+    function _coordinatorRelayAck(uint256 ackChainSrc, address originalReceiver, uint256 sessionId, bytes memory ackPayload) internal {
+        _coordinatorPutInbox(ackChainSrc, originalReceiver, address(l2l2Bridge), sessionId, "ACK", ackPayload);
     }
 
     function _coordinatorSendConfirm(IUniversalBridgeMailbox.MessageHeader memory sendHeader) internal {
@@ -469,7 +470,8 @@ contract ComposeL2IntegrationSetup is Test {
         assertEq(nativeToken.balanceOf(bob), bobBefore);
         assertEq(nativeToken.balanceOf(address(l2l2Bridge)), bridgeBefore);
 
-        bytes32 ackKey = mailbox.getKey(block.chainid, REMOTE_L2_CHAIN_ID, address(l2l2Bridge), address(l2l2Bridge), sessionId, "ACK");
+        // ACK is keyed sender = the original SEND's receiver (the end user), receiver = the bridge.
+        bytes32 ackKey = mailbox.getKey(block.chainid, REMOTE_L2_CHAIN_ID, bob, address(l2l2Bridge), sessionId, "ACK");
         bytes memory expectedAck = abi.encode(address(nativeToken), amount);
         assertEq(keccak256(mailbox.outbox(ackKey)), keccak256(expectedAck));
 
@@ -509,7 +511,7 @@ contract ComposeL2IntegrationSetup is Test {
         assertEq(cet.remoteAsset(), remoteAsset);
         assertEq(cet.remoteChainID(), REMOTE_L2_CHAIN_ID);
 
-        _assertAckOutbox(sessionId, remoteAsset, amount);
+        _assertAckOutbox(sessionId, bob, remoteAsset, amount);
 
         _coordinatorRecvConfirmToken(hdr);
         assertEq(cet.balanceOf(bob), amount);
@@ -521,8 +523,8 @@ contract ComposeL2IntegrationSetup is Test {
         _coordinatorPutInbox(REMOTE_L2_CHAIN_ID, address(l2l2Bridge), receiver, sessionId, "SEND_TOKENS", payload);
     }
 
-    function _assertAckOutbox(uint256 sessionId, address remoteAsset, uint256 amount) internal view {
-        bytes32 ackKey = mailbox.getKey(block.chainid, REMOTE_L2_CHAIN_ID, address(l2l2Bridge), address(l2l2Bridge), sessionId, "ACK");
+    function _assertAckOutbox(uint256 sessionId, address originalReceiver, address remoteAsset, uint256 amount) internal view {
+        bytes32 ackKey = mailbox.getKey(block.chainid, REMOTE_L2_CHAIN_ID, originalReceiver, address(l2l2Bridge), sessionId, "ACK");
         bytes memory expectedAck = abi.encode(remoteAsset, amount);
         assertEq(keccak256(mailbox.outbox(ackKey)), keccak256(expectedAck));
     }

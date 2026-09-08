@@ -171,14 +171,17 @@ contract ComposeL2ToL2Bridge is IComposeL2ToL2Bridge, ReentrancyGuard {
     ///         No balance change: funds were already locked/burned at send time.
     /// @param sendHeader The exact header used when the original SEND message was written.
     function sendConfirm(IUniversalBridgeMailbox.MessageHeader calldata sendHeader) external onlyCoordinator {
-        // ACK messages are always keyed bridge-to-bridge: `writeMessage`/`putInbox` key on the
-        // calling/relayed bridge address, not the end user, since the l2l2 bridge is deployed at
-        // the same address on every chain (CREATE2). This must match what the coordinator relays
-        // via `mailbox.putInbox(sendHeader.chainDest, address(this), address(this), ...)`.
+        // ACK messages are keyed the same way receiveTokens/receiveETH wrote them
+        // (and the same way recvConfirm*/recvAbort* read them back on the other
+        // chain): sender = the original SEND's receiver (the end user), receiver
+        // = the bridge contract, since the l2l2 bridge is deployed at the same
+        // address on every chain (CREATE2). This must match what the coordinator
+        // relays via `mailbox.putInbox(sendHeader.chainDest, sendHeader.receiver,
+        // address(this), ...)`.
         IUniversalBridgeMailbox.MessageHeader memory ackHeader = IUniversalBridgeMailbox.MessageHeader({
             chainSrc: sendHeader.chainDest,
             chainDest: block.chainid,
-            sender: address(this),
+            sender: sendHeader.receiver,
             receiver: address(this),
             sessionId: sendHeader.sessionId,
             label: "ACK"

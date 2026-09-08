@@ -23,6 +23,15 @@ contract UniversalBridgeMailbox is IUniversalBridgeMailbox {
     MessageHeader[] public messageHeaderListInbox;
     MessageHeader[] public messageHeaderListOutbox;
 
+    /// Position of a key's header inside `messageHeaderListInbox`/`Outbox`,
+    /// stored 1-based so that 0 means "absent". Without these, removal had to
+    /// linearly scan the list comparing every header (including a dynamic string),
+    /// so the compensating actions (`unwrite`, `removeInbox`) grew more
+    /// expensive with every message ever written and eventually ran out of gas
+    /// — permanently stranding escrowed funds on an aborted transfer.
+    mapping(bytes32 key => uint256 indexPlusOne) private inboxHeaderIndex;
+    mapping(bytes32 key => uint256 indexPlusOne) private outboxHeaderIndex;
+
     error OnlyBridge();
     error OnlyDeployer();
     error ZeroAddress();
@@ -75,6 +84,7 @@ contract UniversalBridgeMailbox is IUniversalBridgeMailbox {
         inbox[key] = data;
 
         messageHeaderListInbox.push(MessageHeader(chainMessageSender, block.chainid, sender, receiver, sessionId, label));
+        inboxHeaderIndex[key] = messageHeaderListInbox.length;
 
         if (inboxRootPerChain[chainMessageSender] == bytes32(0)) {
             chainIDsInbox.push(chainMessageSender);
@@ -96,7 +106,7 @@ contract UniversalBridgeMailbox is IUniversalBridgeMailbox {
         delete consumedKeys[key];
         createdKeys[key] = false;
 
-        _removeInboxHeader(chainMessageSender, block.chainid, sender, receiver, sessionId, label);
+        _removeInboxHeader(key);
 
         emit DeletedInboxMessage(key);
     }
@@ -125,23 +135,30 @@ contract UniversalBridgeMailbox is IUniversalBridgeMailbox {
         consumedKeys[key] = true;
     }
 
+    /// @dev Keys on `h.sender` rather than `msg.sender`. The two differ only for ACK messages:
+    ///      SEND headers already carry `sender = address(bridge)`, but `receiveTokens`/`receiveETH`
+    ///      set the ACK's `sender` to the original SEND's receiver (the end user). Substituting
+    ///      `msg.sender` here silently rewrote that to the bridge, so the destination chain stored
+    ///      the ACK under a different key than the one the coordinator relays to the source chain
+    ///      via `putInbox` — leaving the two chains' ACK roots permanently unable to reconcile.
     function writeMessage(Message calldata _message) external onlyBridge {
         MessageHeader calldata h = _message.header;
-        bytes32 key = getKey(block.chainid, h.chainDest, msg.sender, h.receiver, h.sessionId, h.label);
+        bytes32 key = getKey(block.chainid, h.chainDest, h.sender, h.receiver, h.sessionId, h.label);
 
         if (createdKeys[key]) revert KeyAlreadyExists();
 
         outbox[key] = _message.payload;
         createdKeys[key] = true;
 
-        messageHeaderListOutbox.push(MessageHeader(block.chainid, h.chainDest, msg.sender, h.receiver, h.sessionId, h.label));
+        messageHeaderListOutbox.push(MessageHeader(block.chainid, h.chainDest, h.sender, h.receiver, h.sessionId, h.label));
+        outboxHeaderIndex[key] = messageHeaderListOutbox.length;
 
         emit NewOutboxKey(messageHeaderListOutbox.length - 1, key);
     }
 
     function unwrite(Message calldata _message) external onlyBridge {
         MessageHeader calldata h = _message.header;
-        bytes32 key = getKey(block.chainid, h.chainDest, msg.sender, h.receiver, h.sessionId, h.label);
+        bytes32 key = getKey(block.chainid, h.chainDest, h.sender, h.receiver, h.sessionId, h.label);
 
         if (!createdKeys[key]) revert MessageNotFound();
         if (keccak256(outbox[key]) != keccak256(_message.payload)) revert MessageNotFound();
@@ -149,7 +166,7 @@ contract UniversalBridgeMailbox is IUniversalBridgeMailbox {
         delete outbox[key];
         createdKeys[key] = false;
 
-        _removeOutboxHeader(block.chainid, h.chainDest, msg.sender, h.receiver, h.sessionId, h.label);
+        _removeOutboxHeader(key);
 
         emit DeletedOutboxMessage(key);
     }
@@ -168,7 +185,7 @@ contract UniversalBridgeMailbox is IUniversalBridgeMailbox {
     }
 
     function updateOutboxRoot(MessageHeader calldata header) external onlyBridge {
-        bytes32 key = getKey(block.chainid, header.chainDest, msg.sender, header.receiver, header.sessionId, header.label);
+        bytes32 key = getKey(block.chainid, header.chainDest, header.sender, header.receiver, header.sessionId, header.label);
 
         if (!createdKeys[key]) revert MessageNotFound();
 
@@ -189,43 +206,44 @@ contract UniversalBridgeMailbox is IUniversalBridgeMailbox {
         return keccak256(abi.encodePacked(m.chainSrc, m.chainDest, m.sender, m.receiver, m.sessionId, m.label));
     }
 
-    function _headerEqualsInbox(
-        MessageHeader storage h,
-        uint256 chainSrc,
-        uint256 chainDest,
-        address sender,
-        address receiver,
-        uint256 sessionId,
-        string memory label
-    ) internal view returns (bool) {
-        if (h.chainSrc != chainSrc) return false;
-        if (h.chainDest != chainDest) return false;
-        if (h.sender != sender) return false;
-        if (h.receiver != receiver) return false;
-        if (h.sessionId != sessionId) return false;
-        if (keccak256(bytes(h.label)) != keccak256(bytes(label))) return false;
-        return true;
+    /// Key of a stored header, matching `getKey`'s encoding.
+    function _headerKey(MessageHeader storage h) internal view returns (bytes32) {
+        return keccak256(abi.encodePacked(h.chainSrc, h.chainDest, h.sender, h.receiver, h.sessionId, h.label));
     }
 
-    function _removeInboxHeader(uint256 chainSrc, uint256 chainDest, address sender, address receiver, uint256 sessionId, string memory label) internal {
-        uint256 len = messageHeaderListInbox.length;
-        for (uint256 i = 0; i < len; i++) {
-            if (_headerEqualsInbox(messageHeaderListInbox[i], chainSrc, chainDest, sender, receiver, sessionId, label)) {
-                messageHeaderListInbox[i] = messageHeaderListInbox[len - 1];
-                messageHeaderListInbox.pop();
-                break;
-            }
+    /// Removes `key`'s header in O(1) via swap-and-pop, re-indexing the element
+    /// moved into the vacated slot. No-op when the key has no header.
+    function _removeInboxHeader(bytes32 key) internal {
+        uint256 indexPlusOne = inboxHeaderIndex[key];
+        if (indexPlusOne == 0) return;
+
+        uint256 index = indexPlusOne - 1;
+        uint256 lastIndex = messageHeaderListInbox.length - 1;
+        if (index != lastIndex) {
+            // Re-key the moved element before it is overwritten.
+            bytes32 movedKey = _headerKey(messageHeaderListInbox[lastIndex]);
+            messageHeaderListInbox[index] = messageHeaderListInbox[lastIndex];
+            inboxHeaderIndex[movedKey] = index + 1;
         }
+
+        messageHeaderListInbox.pop();
+        delete inboxHeaderIndex[key];
     }
 
-    function _removeOutboxHeader(uint256 chainSrc, uint256 chainDest, address sender, address receiver, uint256 sessionId, string memory label) internal {
-        uint256 len = messageHeaderListOutbox.length;
-        for (uint256 i = 0; i < len; i++) {
-            if (_headerEqualsInbox(messageHeaderListOutbox[i], chainSrc, chainDest, sender, receiver, sessionId, label)) {
-                messageHeaderListOutbox[i] = messageHeaderListOutbox[len - 1];
-                messageHeaderListOutbox.pop();
-                break;
-            }
+    /// Outbox counterpart of `_removeInboxHeader`.
+    function _removeOutboxHeader(bytes32 key) internal {
+        uint256 indexPlusOne = outboxHeaderIndex[key];
+        if (indexPlusOne == 0) return;
+
+        uint256 index = indexPlusOne - 1;
+        uint256 lastIndex = messageHeaderListOutbox.length - 1;
+        if (index != lastIndex) {
+            bytes32 movedKey = _headerKey(messageHeaderListOutbox[lastIndex]);
+            messageHeaderListOutbox[index] = messageHeaderListOutbox[lastIndex];
+            outboxHeaderIndex[movedKey] = index + 1;
         }
+
+        messageHeaderListOutbox.pop();
+        delete outboxHeaderIndex[key];
     }
 }

@@ -19,6 +19,8 @@ contract UniversalBridgeMailbox is IUniversalBridgeMailbox {
 
     mapping(bytes32 key => bool used) public createdKeys;
     mapping(bytes32 key => bool consumed) public consumedKeys;
+    mapping(bytes32 key => bool finalized) public finalizedKeys;
+    mapping(bytes32 key => address depositor) public depositorByKey;
 
     MessageHeader[] public messageHeaderListInbox;
     MessageHeader[] public messageHeaderListOutbox;
@@ -104,6 +106,8 @@ contract UniversalBridgeMailbox is IUniversalBridgeMailbox {
 
         delete inbox[key];
         delete consumedKeys[key];
+        delete finalizedKeys[key];
+        delete depositorByKey[key];
         createdKeys[key] = false;
 
         _removeInboxHeader(key);
@@ -126,6 +130,11 @@ contract UniversalBridgeMailbox is IUniversalBridgeMailbox {
         return consumedKeys[key];
     }
 
+    function isFinalized(MessageHeader calldata header) external view returns (bool) {
+        bytes32 key = getKey(header.chainSrc, header.chainDest, header.sender, header.receiver, header.sessionId, header.label);
+        return finalizedKeys[key];
+    }
+
     function markConsumed(MessageHeader calldata header) external onlyBridge {
         bytes32 key = getKey(header.chainSrc, header.chainDest, header.sender, header.receiver, header.sessionId, header.label);
 
@@ -133,6 +142,30 @@ contract UniversalBridgeMailbox is IUniversalBridgeMailbox {
         if (consumedKeys[key]) revert MessageAlreadyConsumed();
 
         consumedKeys[key] = true;
+    }
+
+    function markFinalized(MessageHeader calldata header) external onlyBridge {
+        bytes32 key = getKey(header.chainSrc, header.chainDest, header.sender, header.receiver, header.sessionId, header.label);
+
+        if (!createdKeys[key]) revert MessageNotFound();
+        if (!consumedKeys[key]) revert MessageNotConsumed();
+        if (finalizedKeys[key]) revert MessageAlreadyFinalized();
+
+        finalizedKeys[key] = true;
+    }
+
+    function addDepositor(MessageHeader calldata header, address sender) external onlyBridge {
+        bytes32 key = getKey(header.chainSrc, header.chainDest, header.sender, header.receiver, header.sessionId, header.label);
+        if (!createdKeys[key]) revert MessageNotFound();
+        if (depositorByKey[key] != address(0)) revert DepositorAlreadyAssigned();
+
+        depositorByKey[key] = sender;
+    }
+
+    function getDepositor(MessageHeader calldata header) external view onlyBridge returns (address) {
+        bytes32 key = getKey(header.chainSrc, header.chainDest, header.sender, header.receiver, header.sessionId, header.label);
+        if (!createdKeys[key]) revert MessageNotFound();
+        return depositorByKey[key];
     }
 
     /// @dev Keys on `h.sender` rather than `msg.sender`. The two differ only for ACK messages:
@@ -164,6 +197,7 @@ contract UniversalBridgeMailbox is IUniversalBridgeMailbox {
         if (keccak256(outbox[key]) != keccak256(_message.payload)) revert MessageNotFound();
 
         delete outbox[key];
+        delete depositorByKey[key];
         createdKeys[key] = false;
 
         _removeOutboxHeader(key);

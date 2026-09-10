@@ -113,6 +113,7 @@ contract ComposeL2ToL2Bridge is IComposeL2ToL2Bridge, ReentrancyGuard {
             chainSrc: block.chainid, chainDest: chainDest, sender: address(this), receiver: receiver, sessionId: sessionId, label: "SEND_TOKENS"
         });
         mailbox.writeMessage(IUniversalBridgeMailbox.Message({header: sendHeader, payload: payload}));
+        mailbox.addDepositor(sendHeader, sender);
         emit MailboxWrite(chainDest, receiver, sessionId, "SEND_TOKENS");
 
         bytes32 messageId = keccak256(abi.encodePacked(chainDest, receiver, sessionId, "SEND_TOKENS"));
@@ -140,6 +141,7 @@ contract ComposeL2ToL2Bridge is IComposeL2ToL2Bridge, ReentrancyGuard {
                 chainSrc: block.chainid, chainDest: chainDest, sender: address(this), receiver: receiver, sessionId: sessionId, label: "SEND_TOKENS"
             });
             mailbox.writeMessage(IUniversalBridgeMailbox.Message({header: sendHeader, payload: payload}));
+            mailbox.addDepositor(sendHeader, msg.sender);
         }
 
         emit MailboxWrite(chainDest, receiver, sessionId, "SEND_TOKENS");
@@ -160,6 +162,7 @@ contract ComposeL2ToL2Bridge is IComposeL2ToL2Bridge, ReentrancyGuard {
             chainSrc: block.chainid, chainDest: chainDest, sender: address(this), receiver: receiver, sessionId: sessionId, label: "SEND_ETH"
         });
         mailbox.writeMessage(IUniversalBridgeMailbox.Message({header: sendHeader, payload: payload}));
+        mailbox.addDepositor(sendHeader, msg.sender);
         emit MailboxWrite(chainDest, receiver, sessionId, "SEND_ETH");
 
         bytes32 messageId = keccak256(abi.encodePacked(chainDest, receiver, sessionId, "SEND_ETH"));
@@ -191,6 +194,7 @@ contract ComposeL2ToL2Bridge is IComposeL2ToL2Bridge, ReentrancyGuard {
         if (ackPayload.length == 0) revert NoAckMessage();
 
         mailbox.markConsumed(ackHeader);
+        mailbox.markFinalized(ackHeader);
         mailbox.updateInboxRoot(ackHeader);
         mailbox.updateOutboxRoot(sendHeader);
 
@@ -219,6 +223,8 @@ contract ComposeL2ToL2Bridge is IComposeL2ToL2Bridge, ReentrancyGuard {
         IUniversalBridgeMailbox.MessageHeader memory sendHeader = IUniversalBridgeMailbox.MessageHeader({
             chainSrc: block.chainid, chainDest: chainDest, sender: address(this), receiver: receiver, sessionId: sessionId, label: "SEND_TOKENS"
         });
+        // Before unwrite: it clears `createdKeys`, and getDepositor requires the key to exist.
+        if (mailbox.getDepositor(sendHeader) != sender) revert DepositorMismatch();
         mailbox.unwrite(IUniversalBridgeMailbox.Message({header: sendHeader, payload: payload}));
 
         if (isCET) {
@@ -238,6 +244,7 @@ contract ComposeL2ToL2Bridge is IComposeL2ToL2Bridge, ReentrancyGuard {
         IUniversalBridgeMailbox.MessageHeader memory sendHeader = IUniversalBridgeMailbox.MessageHeader({
             chainSrc: block.chainid, chainDest: chainDest, sender: address(this), receiver: receiver, sessionId: sessionId, label: "SEND_ETH"
         });
+        if (mailbox.getDepositor(sendHeader) != sender) revert DepositorMismatch();
         mailbox.unwrite(IUniversalBridgeMailbox.Message({header: sendHeader, payload: payload}));
 
         ethLiquidity.mint(amount);
@@ -326,6 +333,7 @@ contract ComposeL2ToL2Bridge is IComposeL2ToL2Bridge, ReentrancyGuard {
     ///         balance while pending.
     function recvConfirmToken(IUniversalBridgeMailbox.MessageHeader calldata msgHeader) external onlyCoordinator returns (address token, uint256 amount) {
         if (!mailbox.isConsumed(msgHeader)) revert IUniversalBridgeMailbox.MessageNotConsumed();
+        if (mailbox.isFinalized(msgHeader)) revert IUniversalBridgeMailbox.MessageAlreadyFinalized();
 
         bytes memory m = mailbox.readMessage(msgHeader);
         uint256 remoteChainID;
@@ -333,6 +341,7 @@ contract ComposeL2ToL2Bridge is IComposeL2ToL2Bridge, ReentrancyGuard {
         (remoteChainID, remoteAsset, amount,,,) = abi.decode(m, (uint256, address, uint256, string, string, uint8));
 
         token = remoteChainID == block.chainid ? remoteAsset : computeCETAddress(remoteAsset, remoteChainID);
+        mailbox.markFinalized(msgHeader);
         IERC20(token).safeTransfer(msgHeader.receiver, amount);
 
         IUniversalBridgeMailbox.MessageHeader memory ackHeader = IUniversalBridgeMailbox.MessageHeader({
@@ -354,6 +363,8 @@ contract ComposeL2ToL2Bridge is IComposeL2ToL2Bridge, ReentrancyGuard {
     ///         provisional ACK message.
     function recvAbortToken(IUniversalBridgeMailbox.MessageHeader calldata msgHeader) external onlyCoordinator {
         if (!mailbox.isConsumed(msgHeader)) revert IUniversalBridgeMailbox.MessageNotConsumed();
+        if (mailbox.isFinalized(msgHeader)) revert IUniversalBridgeMailbox.MessageAlreadyFinalized();
+        mailbox.markFinalized(msgHeader);
 
         bytes memory m = mailbox.readMessage(msgHeader);
         uint256 remoteChainID;
@@ -374,6 +385,7 @@ contract ComposeL2ToL2Bridge is IComposeL2ToL2Bridge, ReentrancyGuard {
             sessionId: msgHeader.sessionId,
             label: "ACK"
         });
+
         mailbox.unwrite(IUniversalBridgeMailbox.Message({header: ackHeader, payload: abi.encode(remoteAsset, amount)}));
 
         emit RecvAborted(msgHeader.chainSrc, msgHeader.receiver, msgHeader.sessionId, msgHeader.label);
@@ -383,10 +395,12 @@ contract ComposeL2ToL2Bridge is IComposeL2ToL2Bridge, ReentrancyGuard {
     ///         finalizes both the SEND inbox root and the ACK outbox root.
     function recvConfirmETH(IUniversalBridgeMailbox.MessageHeader calldata msgHeader) external onlyCoordinator returns (uint256 amount) {
         if (!mailbox.isConsumed(msgHeader)) revert IUniversalBridgeMailbox.MessageNotConsumed();
+        if (mailbox.isFinalized(msgHeader)) revert IUniversalBridgeMailbox.MessageAlreadyFinalized();
 
         bytes memory m = mailbox.readMessage(msgHeader);
         (, amount) = abi.decode(m, (uint256, uint256));
 
+        mailbox.markFinalized(msgHeader);
         (bool ok,) = msgHeader.receiver.call{value: amount}("");
         if (!ok) revert TransferFailed();
 
@@ -408,6 +422,8 @@ contract ComposeL2ToL2Bridge is IComposeL2ToL2Bridge, ReentrancyGuard {
     ///         pool (undoing the mint from receiveETH) and removes the provisional ACK message.
     function recvAbortETH(IUniversalBridgeMailbox.MessageHeader calldata msgHeader) external onlyCoordinator {
         if (!mailbox.isConsumed(msgHeader)) revert IUniversalBridgeMailbox.MessageNotConsumed();
+        if (mailbox.isFinalized(msgHeader)) revert IUniversalBridgeMailbox.MessageAlreadyFinalized();
+        mailbox.markFinalized(msgHeader);
 
         bytes memory m = mailbox.readMessage(msgHeader);
         (, uint256 amount) = abi.decode(m, (uint256, uint256));

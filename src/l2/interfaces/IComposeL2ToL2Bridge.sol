@@ -43,4 +43,7 @@ interface IComposeL2ToL2Bridge {
     error UseBridgeCETTo();
     error NotCoreComposeable();
     error InsufficientEscrowBalance();
+    /// @notice The `sender` the coordinator passed to an abort is not the depositor the mailbox
+    ///         recorded at send time.
+    error DepositorMismatch();
 }

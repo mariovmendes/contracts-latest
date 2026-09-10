@@ -376,6 +376,89 @@ contract ComposeL2ToL2BridgeInterleaved is ComposeL2IntegrationSetup {
         assertEq(ComposableERC20(cetConfirmed).balanceOf(bob), amount);
     }
 
+    /// The coordinator still names the refund recipient, but the mailbox recorded the real
+    /// depositor at send time, so naming anyone else reverts instead of redirecting the escrow.
+    function test_sendAbortToken_revertsWhenSenderIsNotDepositor() public {
+        uint256 amount = 1e18;
+        uint256 sessionId = 0x9001;
+
+        vm.startPrank(alice);
+        nativeToken.approve(address(l2l2Bridge), amount);
+        l2l2Bridge.bridgeERC20To(REMOTE_L2_CHAIN_ID, address(nativeToken), amount, bob, sessionId);
+        vm.stopPrank();
+
+        vm.prank(coordinator);
+        vm.expectRevert(IComposeL2ToL2Bridge.DepositorMismatch.selector);
+        l2l2Bridge.sendAbortToken(REMOTE_L2_CHAIN_ID, address(nativeToken), bob, bob, amount, sessionId);
+
+        // The real depositor is still refundable.
+        uint256 aliceBefore = nativeToken.balanceOf(alice);
+        vm.prank(coordinator);
+        l2l2Bridge.sendAbortToken(REMOTE_L2_CHAIN_ID, address(nativeToken), alice, bob, amount, sessionId);
+        assertEq(nativeToken.balanceOf(alice), aliceBefore + amount);
+    }
+
+    /// Regression: the recv terminals gated on `isConsumed` but wrote no state,
+    /// so a coordinator retry replayed them — paying the receiver twice and
+    /// XOR-ing the same value into both roots a second time, silently undoing
+    /// the finalization. `markFinalized` makes them one-shot.
+    function test_recvConfirmToken_revertsOnReplay() public {
+        address remoteAsset = makeAddr("remoteAssetReplay");
+        uint256 amount = 20e18;
+        uint256 sessionId = 0x8001;
+
+        bytes memory payload = abi.encode(REMOTE_L2_CHAIN_ID, remoteAsset, amount, "R", "R", uint8(18));
+        _coordinatorPutInbox(REMOTE_L2_CHAIN_ID, address(l2l2Bridge), bob, sessionId, "SEND_TOKENS", payload);
+        IUniversalBridgeMailbox.MessageHeader memory hdr = _recvHeader(REMOTE_L2_CHAIN_ID, bob, sessionId, "SEND_TOKENS");
+        vm.prank(bob);
+        l2l2Bridge.receiveTokens(hdr);
+
+        vm.prank(coordinator);
+        l2l2Bridge.recvConfirmToken(hdr);
+
+        address cet = cetFactory.predictAddress(remoteAsset, REMOTE_L2_CHAIN_ID);
+        assertEq(ComposableERC20(cet).balanceOf(bob), amount);
+
+        vm.prank(coordinator);
+        vm.expectRevert(IUniversalBridgeMailbox.MessageAlreadyFinalized.selector);
+        l2l2Bridge.recvConfirmToken(hdr);
+
+        // ...and a confirmed session can no longer be compensated either.
+        vm.prank(coordinator);
+        vm.expectRevert(IUniversalBridgeMailbox.MessageAlreadyFinalized.selector);
+        l2l2Bridge.recvAbortToken(hdr);
+
+        assertEq(ComposableERC20(cet).balanceOf(bob), amount);
+    }
+
+    /// ETH counterpart of test_recvConfirmToken_revertsOnReplay: a replayed confirm would have
+    /// paid the receiver a second time out of the bridge's pending balance.
+    function test_recvConfirmETH_revertsOnReplay() public {
+        uint256 amount = 2 ether;
+        uint256 sessionId = 0x8002;
+
+        bytes memory payload = abi.encode(REMOTE_L2_CHAIN_ID, amount);
+        _coordinatorPutInbox(REMOTE_L2_CHAIN_ID, address(l2l2Bridge), bob, sessionId, "SEND_ETH", payload);
+        IUniversalBridgeMailbox.MessageHeader memory hdr = _recvHeader(REMOTE_L2_CHAIN_ID, bob, sessionId, "SEND_ETH");
+        vm.prank(bob);
+        l2l2Bridge.receiveETH(hdr);
+
+        uint256 bobBefore = bob.balance;
+        vm.prank(coordinator);
+        l2l2Bridge.recvConfirmETH(hdr);
+        assertEq(bob.balance, bobBefore + amount);
+
+        vm.prank(coordinator);
+        vm.expectRevert(IUniversalBridgeMailbox.MessageAlreadyFinalized.selector);
+        l2l2Bridge.recvConfirmETH(hdr);
+
+        vm.prank(coordinator);
+        vm.expectRevert(IUniversalBridgeMailbox.MessageAlreadyFinalized.selector);
+        l2l2Bridge.recvAbortETH(hdr);
+
+        assertEq(bob.balance, bobBefore + amount);
+    }
+
     // ============================================================
     // compensation cost must not scale with outbox size
     // ============================================================

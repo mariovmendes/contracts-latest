@@ -42,7 +42,7 @@ SessionStateSet == {"unprocessed", "processing", "confirmed", "aborted"}
 LABEL == {"SEND", "ACK SEND"}
 
 MessageData == [sender: USERS, receiver: USERS, token: TOKENS,
-                amount: 0..MAX_AMOUNT, consumed: BOOLEAN]
+                amount: 0..MAX_AMOUNT, consumed: BOOLEAN, finalized: BOOLEAN]
 
 (*************************************************************************)
 (* Type Invariant                                                        *)
@@ -202,7 +202,7 @@ Send(srcChain, destChain, sender, receiver, token, amount, sessionId, senderBrid
             sessionId, "SEND"] # Empty))
     /\ LET msg == [sender   |-> sender,   receiver |-> receiver,
                    token    |-> token,    amount   |-> amount,
-                   consumed |-> FALSE]
+                   consumed |-> FALSE,    finalized |-> FALSE]
        IN
        /\ accountBalances' = [accountBalances EXCEPT ![srcChain, sender] = @ - amount]
        /\ outbox'          = [outbox EXCEPT
@@ -283,7 +283,7 @@ Recv(srcChain, destChain, sender, receiver, token, amount, sessionId, senderBrid
                             [msg EXCEPT !.consumed = TRUE]]
        /\ LET ackMsg == [sender   |-> sender, receiver |-> receiver,
                          token    |-> token,    amount   |-> amount,
-                         consumed |-> FALSE]
+                         consumed |-> FALSE, finalized |-> FALSE]
           IN outbox' = [outbox EXCEPT
                             ![destBridge, destChain, srcChain,
                               sender, receiver, sessionId, "ACK SEND"] = ackMsg]
@@ -443,17 +443,20 @@ RecvConfirm(srcChain, destChain, sender, receiver, sessionId, senderBridge, dest
            remainingRecv == chainRecvRoles[destChain, sessionId] - 1
        IN  /\ recvdMsg # Empty
            /\ recvdMsg.consumed = TRUE
+           /\ recvdMsg.finalized = FALSE
            /\ bridgesTokenBalances[destBridge, recvdMsg.token] >= recvdMsg.amount
            /\ accountBalances'     = [accountBalances
                                      EXCEPT ![destChain, receiver] = @ + recvdMsg.amount]
            /\ bridgesTokenBalances' = [bridgesTokenBalances
                                      EXCEPT ![destBridge, recvdMsg.token] = @ - recvdMsg.amount]
+           /\ inbox' = [inbox EXCEPT ![destBridge, srcChain, destChain, sender, receiver, sessionId,
+                                       "SEND"] = [recvdMsg EXCEPT !.finalized = TRUE]]
            /\ chainRecvRoles' = [chainRecvRoles EXCEPT ![destChain, sessionId] = remainingRecv]
            /\ chainSessionStates' = IF /\ remainingSend = 0
                                        /\ remainingRecv = 0
                                     THEN [chainSessionStates EXCEPT ![destChain, sessionId] = "confirmed"]
                                     ELSE chainSessionStates
-     /\ UNCHANGED <<initialBalances, inbox, outbox, chainSendRoles, chainSessionMembers, generalSessionStates,
+     /\ UNCHANGED <<initialBalances, outbox, chainSendRoles, chainSessionMembers, generalSessionStates,
                     msgs, spClock, chainClock>>
 
 RecvAbort(srcChain, destChain, sender, receiver, sessionId, senderBridge, destBridge) ==
@@ -470,6 +473,7 @@ RecvAbort(srcChain, destChain, sender, receiver, sessionId, senderBridge, destBr
            remainingRecv == chainRecvRoles[destChain, sessionId] - 1
        IN  /\ recvdMsg # Empty
            /\ recvdMsg.consumed = TRUE
+           /\ recvdMsg.finalized = FALSE
            /\ bridgesTokenBalances[destBridge, recvdMsg.token] >= recvdMsg.amount
            /\ bridgesTokenBalances' = [bridgesTokenBalances EXCEPT ![destBridge, recvdMsg.token]
                                        = @ - recvdMsg.amount]

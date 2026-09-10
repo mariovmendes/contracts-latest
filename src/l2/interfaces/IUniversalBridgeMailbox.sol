@@ -20,6 +20,8 @@ interface IUniversalBridgeMailbox {
     error MessageNotFound();
     error MessageAlreadyConsumed();
     error MessageNotConsumed();
+    error MessageAlreadyFinalized();
+    error DepositorAlreadyAssigned();
     error KeyAlreadyExists();
     error InvalidId();
 
@@ -36,6 +38,20 @@ interface IUniversalBridgeMailbox {
 
     /// @notice Marks a previously put inbox message as consumed. Reverts if already consumed. Bridge-only.
     function markConsumed(MessageHeader calldata header) external;
+
+    /// @notice Whether this message inbox message for `header` has been used before.
+    function isFinalized(MessageHeader calldata header) external view returns(bool);
+
+    /// @notice Marks a previously consumed message as finalized. Reverts if already finalized or never consumed.
+    /// Bridge-only.
+    function markFinalized(MessageHeader calldata header) external;
+
+    /// @notice Records who funded the message for `header`, so a compensating action can pay them
+    ///         back without trusting a caller-supplied address. Reverts if already set. Bridge-only.
+    function addDepositor(MessageHeader calldata header, address sender) external;
+
+    /// @notice The depositor recorded by `addDepositor`, or address(0) if none. Bridge-only.
+    function getDepositor(MessageHeader calldata header) external view returns (address);
 
     /// @notice Writes a provisional outbox message. Does not update the outbox root. Bridge-only.
     function writeMessage(Message calldata message) external;

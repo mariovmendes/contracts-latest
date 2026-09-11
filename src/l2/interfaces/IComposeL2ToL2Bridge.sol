@@ -18,6 +18,16 @@ interface IComposeL2ToL2Bridge {
     event MailboxWrite(uint256 indexed chainId, address indexed account, uint256 indexed sessionId, string label);
     event MailboxAckWrite(uint256 indexed chainId, address indexed account, uint256 indexed sessionId, string label);
 
+    /// @notice Emitted when the coordinator finalizes a send after observing its ACK.
+    event SendConfirmed(uint256 indexed chainDest, address indexed receiver, uint256 indexed sessionId, string label);
+    /// @notice Emitted when the coordinator compensates (rolls back) a send.
+    event SendAborted(uint256 indexed chainDest, address indexed sender, uint256 indexed sessionId, string label);
+    /// @notice Emitted when the coordinator finalizes a recv, delivering funds to the receiver.
+    event RecvConfirmed(uint256 indexed chainSrc, address indexed receiver, uint256 indexed sessionId, string label);
+    /// @notice Emitted when the coordinator compensates (rolls back) a recv.
+    event RecvAborted(uint256 indexed chainSrc, address indexed receiver, uint256 indexed sessionId, string label);
+
+    error InvalidCoordinator();
     error Unauthorized();
     error WrongDestinationChain();
     error InvalidMessage();
@@ -33,4 +43,7 @@ interface IComposeL2ToL2Bridge {
     error UseBridgeCETTo();
     error NotCoreComposeable();
     error InsufficientEscrowBalance();
+    /// @notice The `sender` the coordinator passed to an abort is not the depositor the mailbox
+    ///         recorded at send time.
+    error DepositorMismatch();
 }

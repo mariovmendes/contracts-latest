@@ -48,15 +48,20 @@ MessageData == [sender: USERS, receiver: USERS, token: TOKENS,
 (* Type Invariant                                                        *)
 (*************************************************************************)
 
+\* Nothing is minted or burned (see SupplyConservedAtEnd), so no single
+\* balance can ever exceed the total supply. MAX_AMOUNT bounds a single
+\* transfer, which is a different thing and not a sound balance bound.
+TOTAL_SUPPLY == Cardinality(CHAINS) * Cardinality(USERS) * INITIAL_BALANCE
+
 TPTypeOK ==
-    /\ initialBalances      \in [SESSIONS -> [CHAINS \X USERS -> 0..MAX_AMOUNT]]
-    /\ accountBalances      \in [CHAINS \X USERS -> 0..MAX_AMOUNT]
+    /\ initialBalances      \in [SESSIONS -> [CHAINS \X USERS -> 0..TOTAL_SUPPLY]]
+    /\ accountBalances      \in [CHAINS \X USERS -> 0..TOTAL_SUPPLY]
     /\ generalSessionStates \in [SESSIONS -> SessionStateSet]
     /\ chainSessionStates   \in [CHAINS \X SESSIONS -> SessionStateSet]
     /\ chainSendRoles \in [CHAINS \X SESSIONS -> Nat]
     /\ chainRecvRoles \in [CHAINS \X SESSIONS -> Nat]
     /\ chainSessionMembers \in [SESSIONS -> SUBSET CHAINS]
-    /\ bridgesTokenBalances  \in [BRIDGES \X TOKENS -> 0..MAX_AMOUNT]
+    /\ bridgesTokenBalances  \in [BRIDGES \X TOKENS -> 0..TOTAL_SUPPLY]
     /\ msgs                 \subseteq Messages2PC
     /\ inbox                \in [BRIDGES \X CHAINS \X CHAINS \X USERS \X USERS
                                 \X SESSIONS \X LABEL
@@ -575,8 +580,7 @@ TotalSupply ==
     SumFunction(accountBalances) + SumFunction(bridgesTokenBalances)
 
 SupplyConservedAtEnd ==
-    AllSessionsTerminal =>
-        TotalSupply = Cardinality(CHAINS) * Cardinality(USERS) * INITIAL_BALANCE
+    AllSessionsTerminal => TotalSupply = TOTAL_SUPPLY
         
 (*************************************************************************)
 (* Fairness, Done, Next and Spec                                         *)
